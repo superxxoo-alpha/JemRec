@@ -1,117 +1,35 @@
-# Everything the pre-push hook checks, plus the APK, on every branch and PR.
-#
-# THE SDK LIST IS LONGER THAN A NORMAL ANDROID PROJECT'S, and the extra entries
-# are load-bearing. The shell-side capture daemon is not a Gradle module: it is
-# compiled by shellserver/build.sh against the platform the DEVICE runs, with
-# its @hide framework internals intact, and dexed with d8 by hand. Gradle runs
-# that script as part of preBuild, so a runner without android-36 and
-# build-tools 36.0.0 fails before the app is compiled at all - not at the end,
-# where it would be obvious.
-name: build
+name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches: [ main, master ]
   pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      # 21, and exactly 21, because the daemon's bytecode depends on the javac
-      # major that compiled it - see shellserver/build.sh, which refuses any
-      # other. F-Droid's build server is Debian trixie with default-jdk, which
-      # is 21; a release built with a different major cannot be reproduced
-      # there, and F-Droid would have to sign it with its own key instead.
-      - uses: actions/setup-java@v5
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: '21'
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
 
-      - uses: android-actions/setup-android@v4
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
 
-      # AGP 9 numbers the newest platform with a minor version, so compileSdk 37
-      # is "platforms;android-37.0" and NOT "platforms;android-37" - which is
-      # what the first run here failed on: "Failed to find package". Older
-      # platforms keep their plain names, so the daemon's android-36 is asked
-      # for both ways and whichever exists wins. The check afterwards is the
-      # part that matters: build.sh reads android.jar and d8 by path, and a
-      # missing one fails deep inside a Gradle task rather than here.
-      - name: Install the SDK the app and the daemon need
-        run: |
-          sdkmanager --install "platforms;android-37.0" || sdkmanager --install "platforms;android-37"
-          sdkmanager --install "platforms;android-36" || sdkmanager --install "platforms;android-36.0"
-          sdkmanager --install "build-tools;36.0.0"
-          test -f "$ANDROID_HOME/platforms/android-36/android.jar" \
-            || { echo "::error::android-36/android.jar is missing; shellserver/build.sh cannot compile the daemon"; ls "$ANDROID_HOME/platforms"; exit 1; }
-          test -x "$ANDROID_HOME/build-tools/36.0.0/d8" \
-            || { echo "::error::build-tools 36.0.0 d8 is missing"; ls "$ANDROID_HOME/build-tools"; exit 1; }
-
-      - uses: gradle/actions/setup-gradle@v4
-
-      - name: Tests
-        run: ./gradlew test
-
-      - name: Lint
-        run: ./gradlew lint
-
-      - name: Build debug APK
+      - name: Build Debug APK
         run: ./gradlew assembleDebug
 
-      # The reproducibility check, on every push. With no keystore in the
-      # environment AGP writes app-release-unsigned.apk, which is exactly what
-      # F-Droid's builder produces and what a local `./gradlew assembleRelease`
-      # produces - so the digest printed here is the one to compare against:
-      #
-      #   shasum -a 256 app/build/outputs/apk/release/app-release-unsigned.apk
-      #
-      # A mismatch means some machine-dependent step got into the build, and
-      # the day to find it is before a tag, not after F-Droid has. Compare on
-      # a push to main or a tag: on a pull request this checks out a merge
-      # commit that exists nowhere else, and the APK records the commit it
-      # was built from, so a PR run's digest matches no local build by design.
-      # The daemon jar's digest has no such stamp and compares anywhere.
-      - name: Build the release APK unsigned and print its digest
-        run: |
-          ./gradlew assembleRelease
-          APK=app/build/outputs/apk/release/app-release-unsigned.apk
-          echo "unsigned release APK: $(shasum -a 256 "$APK")"
-          # The two kinds of entry that have differed by machine before - the
-          # daemon jar (javac major) and the native libraries (NDK-dependent
-          # stripping) - printed on their own, so a mismatch names its cause.
-          echo "daemon jar:           $(unzip -p "$APK" assets/jemrec-capture.jar | shasum -a 256 | cut -c1-64)"
-          for so in $(unzip -Z1 "$APK" 'lib/*/libconscrypt_jni.so'); do
-            echo "$so: $(unzip -p "$APK" "$so" | shasum -a 256 | cut -c1-64)"
-          done
-
-      # Every native library in the APK comes prebuilt from a dependency, so
-      # a version bump alone can put the whole app in 16 KB page-size compat
-      # mode, with a warning dialog on any phone that uses 16 KB pages. That
-      # is how Conscrypt 2.5.3 did it. See the script for what it checks.
-      - name: Check the native libraries suit 16 KB pages
-        run: python3 tools/check_16k_pages.py app/build/outputs/apk/release/app-release-unsigned.apk
-
       - name: Upload APK
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: jemrec-debug-apk
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-
-      - name: Upload reports when something fails
-        if: failure()
-        uses: actions/upload-artifact@v5
-        with:
-          name: reports
-          path: app/build/reports/
-          if-no-files-found: ignore

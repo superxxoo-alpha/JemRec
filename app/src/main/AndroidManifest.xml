@@ -190,6 +190,7 @@
         <package android:name="org.thunderdog.challegram" />
         <package android:name="org.thoughtcrime.securesms" />
         <package android:name="com.viber.voip" />
+        <package android:name="com.tencent.mm" />
         <!--
           The shell, whose permissions decide whether messenger calls can be
           recorded at all: see VoipApps.supported.

@@ -22,6 +22,12 @@ import com.jemcik.jemrec.Prefs
  * Signal uses the same path; an app can still mark its audio as not to be
  * captured, which Android honours - the recording then has the user's side
  * only.
+ *
+ * WeChat is listed but was not measured here. Its calls are expected on usage
+ * 3 (voice-communication signalling) as well as 2, so the daemon's mix and
+ * its call test both accept either (Voip.java); OPPO's own third-party call
+ * recorder copies the same two usages, which is the evidence it can be done
+ * at all. Whether WeChat lets its audio be copied is still its own choice.
  */
 object VoipApps {
 
@@ -36,6 +42,7 @@ object VoipApps {
         App("org.thunderdog.challegram", "Telegram X", "telegram"),
         App("org.thoughtcrime.securesms", "Signal", "signal"),
         App("com.viber.voip", "Viber", "viber"),
+        App("com.tencent.mm", "WeChat", "wechat"),
     )
 
     /** For a package not on the list, which should never be recording - but

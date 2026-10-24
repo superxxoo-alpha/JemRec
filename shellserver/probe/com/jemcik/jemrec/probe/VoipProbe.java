@@ -31,7 +31,12 @@ import java.util.Locale;
  * jar by probe/build-probe.sh and run by hand as the shell user.
  *
  *   CLASSPATH=/data/local/tmp/voip-probe.jar app_process / \
- *       com.jemcik.jemrec.probe.VoipProbe [minutes] [mic|vc|vr|none]
+ *       com.jemcik.jemrec.probe.VoipProbe [minutes] [mic|vc|vr|none] [2|3|2+3]
+ *
+ * The third argument is what the policy copies: usage 2 (voice communication)
+ * alone, 3 (its signalling stream) alone, or both - the default, because a
+ * messenger may put its call audio on either and the probe is how that is
+ * found out. OPPO's own third-party call recorder copies both.
  *
  * It answers one question per messenger: can the shell user, with the
  * permissions it already holds, record both sides of that app's call without
@@ -71,6 +76,7 @@ public final class VoipProbe {
     public static void main(String[] args) throws Exception {
         int minutes = args.length > 0 ? Integer.parseInt(args[0]) : 30;
         String near = args.length > 1 ? args[1] : "mic";
+        int[] usages = args.length > 2 ? parseUsages(args[2]) : new int[] { 2, 3 };
         // Before ANY mention of Workarounds: its static block builds an
         // ActivityThread, which needs a Looper (see Main.prepareMainLooper).
         Looper.prepare();
@@ -84,9 +90,10 @@ public final class VoipProbe {
         }
         AudioManager audio = (AudioManager) FakeContext.get().getSystemService(Context.AUDIO_SERVICE);
         log("probe: sdk=" + Build.VERSION.SDK_INT + " " + Build.MANUFACTURER + " " + Build.MODEL
-                + " build=" + Build.DISPLAY + " near=" + near + " minutes=" + minutes);
+                + " build=" + Build.DISPLAY + " near=" + near + " usages=" + join(usages)
+                + " minutes=" + minutes);
 
-        Policy policy = Policy.register();
+        Policy policy = Policy.register(usages);
 
         long until = SystemClock.elapsedRealtime() + minutes * 60_000L;
         Session session = null;
@@ -144,6 +151,32 @@ public final class VoipProbe {
         }
     }
 
+    /** "2", "3" or "2+3": the playback usages the policy copies. */
+    private static int[] parseUsages(String arg) {
+        String[] parts = arg.split("\\+");
+        int[] usages = new int[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            int usage = Integer.parseInt(parts[i].trim());
+            if (usage != AudioAttributes.USAGE_VOICE_COMMUNICATION
+                    && usage != AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING) {
+                throw new IllegalArgumentException("usages must be 2, 3 or 2+3: " + arg);
+            }
+            usages[i] = usage;
+        }
+        return usages;
+    }
+
+    private static String join(int[] usages) {
+        StringBuilder out = new StringBuilder();
+        for (int usage : usages) {
+            if (out.length() > 0) {
+                out.append('+');
+            }
+            out.append(usage);
+        }
+        return out.toString();
+    }
+
     /** A hidden getter, by name, or null. */
     static Object hidden(Object target, String name) {
         try {
@@ -170,26 +203,30 @@ public final class VoipProbe {
 
         /** Privileged first (may also reach apps that allow capture by the
          *  system only); without it if the platform refuses. */
-        static Policy register() throws Exception {
+        static Policy register(int[] usages) throws Exception {
             try {
-                return register(true);
+                return register(true, usages);
             } catch (Throwable t) {
                 log("policy: privileged registration failed (" + t + "); trying without");
-                return register(false);
+                return register(false, usages);
             }
         }
 
         @SuppressLint("PrivateApi")
-        private static Policy register(boolean privileged) throws Exception {
+        private static Policy register(boolean privileged, int[] usages) throws Exception {
             Class<?> ruleClass = Class.forName("android.media.audiopolicy.AudioMixingRule");
             Class<?> ruleBuilderClass = Class.forName("android.media.audiopolicy.AudioMixingRule$Builder");
             Object ruleBuilder = ruleBuilderClass.getConstructor().newInstance();
             ruleBuilderClass.getMethod("setTargetMixRole", int.class)
                     .invoke(ruleBuilder, ruleClass.getField("MIX_ROLE_PLAYERS").getInt(null));
-            AudioAttributes voice = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).build();
-            ruleBuilderClass.getMethod("addMixRule", int.class, Object.class)
-                    .invoke(ruleBuilder, ruleClass.getField("RULE_MATCH_ATTRIBUTE_USAGE").getInt(null), voice);
+            // One rule per usage, and the rules are ORed: a player matching
+            // either is copied.
+            for (int usage : usages) {
+                AudioAttributes attributes = new AudioAttributes.Builder().setUsage(usage).build();
+                ruleBuilderClass.getMethod("addMixRule", int.class, Object.class)
+                        .invoke(ruleBuilder, ruleClass.getField("RULE_MATCH_ATTRIBUTE_USAGE").getInt(null),
+                                attributes);
+            }
             // BEFORE build(): on the builder it is a property of the rule built.
             ruleBuilderClass.getMethod("voiceCommunicationCaptureAllowed", boolean.class).invoke(ruleBuilder, true);
             if (privileged) {
@@ -223,7 +260,7 @@ public final class VoipProbe {
             if (result != 0) {
                 throw new IllegalStateException("registerAudioPolicyStatic returned " + result);
             }
-            log("policy: registered (privileged=" + privileged + "), copying USAGE_VOICE_COMMUNICATION");
+            log("policy: registered (privileged=" + privileged + "), copying usage " + join(usages));
             return new Policy(policy, mix, policyClass, mixClass);
         }
 

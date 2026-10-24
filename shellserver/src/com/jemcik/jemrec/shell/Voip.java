@@ -24,8 +24,9 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -76,6 +77,18 @@ final class Voip {
     }
 
     private static final int SAMPLE_RATE = AudioConfig.SAMPLE_RATE;
+    /**
+     * The usages a messenger call's playback can carry: the call itself (2),
+     * and its signalling stream (3) - dial tones, ringback, and on some
+     * versions the call's own audio. WeChat has been reported on both, and
+     * the probe is how that is settled on a phone; the mix copies either, and
+     * a call is either, so a call is not missed for being on the one the
+     * other messengers do not use.
+     */
+    private static final int[] CALL_USAGES = {
+            AudioAttributes.USAGE_VOICE_COMMUNICATION,
+            AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING,
+    };
     /** How often a call is looked for, and its end, while one may be up. */
     private static final long POLL_MS = 500L;
     /** The mode has to stay out of a call this long for the call to be over. */
@@ -186,8 +199,25 @@ final class Voip {
             this.mixClass = mixClass;
         }
 
-        @SuppressLint("PrivateApi")
+        /**
+         * The mix, with the privileged flag where Android takes it. A rule
+         * built without allowPrivilegedPlaybackCapture is not offered audio
+         * an app marked ALLOW_CAPTURE_BY_SYSTEM, and a messenger may mark it
+         * so; the probe measured the difference. A platform that refuses the
+         * flag still gets the plain rule, which is what earlier versions
+         * registered.
+         */
         static Policy register() throws Exception {
+            try {
+                return register(true);
+            } catch (Throwable t) {
+                Ln.w("voip: privileged registration failed (" + t + "); trying without");
+                return register(false);
+            }
+        }
+
+        @SuppressLint("PrivateApi")
+        private static Policy register(boolean privileged) throws Exception {
             Class<?> ruleClass = Class.forName("android.media.audiopolicy.AudioMixingRule");
             Class<?> ruleBuilderClass = Class.forName("android.media.audiopolicy.AudioMixingRule$Builder");
             Object ruleBuilder = ruleBuilderClass.getConstructor().newInstance();
@@ -199,11 +229,17 @@ final class Voip {
                 ruleBuilderClass.getMethod("setTargetMixRole", int.class)
                         .invoke(ruleBuilder, ruleClass.getField("MIX_ROLE_PLAYERS").getInt(null));
             }
-            AudioAttributes voice = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION).build();
-            ruleBuilderClass.getMethod("addMixRule", int.class, Object.class)
-                    .invoke(ruleBuilder, ruleClass.getField("RULE_MATCH_ATTRIBUTE_USAGE").getInt(null), voice);
+            // One rule per usage, and the rules are ORed: a player matching
+            // either is copied.
+            for (int usage : CALL_USAGES) {
+                AudioAttributes attributes = new AudioAttributes.Builder().setUsage(usage).build();
+                ruleBuilderClass.getMethod("addMixRule", int.class, Object.class)
+                        .invoke(ruleBuilder, ruleClass.getField("RULE_MATCH_ATTRIBUTE_USAGE").getInt(null), attributes);
+            }
             ruleBuilderClass.getMethod("voiceCommunicationCaptureAllowed", boolean.class).invoke(ruleBuilder, true);
+            if (privileged) {
+                ruleBuilderClass.getMethod("allowPrivilegedPlaybackCapture", boolean.class).invoke(ruleBuilder, true);
+            }
             Object rule = ruleBuilderClass.getMethod("build").invoke(ruleBuilder);
 
             Class<?> mixClass = Class.forName("android.media.audiopolicy.AudioMix");
@@ -231,7 +267,8 @@ final class Voip {
                 throw new IllegalStateException("registerAudioPolicyStatic returned " + result
                         + " - Android refused to let the shell copy call audio");
             }
-            Ln.i("voip: audio policy registered, copying voice-call playback");
+            Ln.i("voip: audio policy registered, copying voice-call playback (usage 2 and 3"
+                    + (privileged ? ", privileged" : "") + ")");
             return new Policy(policy, mix, policyClass, mixClass);
         }
 
@@ -277,6 +314,8 @@ final class Voip {
         private String active;
         /** The uid of [active]'s app, to ask whether it is still in its call. */
         private int activeUid = -1;
+        /** The usage [active]'s call audio was found on: 2, or 3. */
+        private int activeUsage = -1;
         /** The mode left "communication" while the app still talked; said once. */
         private boolean heldOver;
         private long leftAt;
@@ -334,6 +373,7 @@ final class Voip {
                 Ln.i("voip: no longer watching; ending the call in " + active);
                 active = null;
                 activeUid = -1;
+                activeUsage = -1;
                 heldOver = false;
                 listener.onVoipCallEnd();
             }
@@ -368,7 +408,7 @@ final class Voip {
                 if (app != null) {
                     active = app;
                     leftAt = 0;
-                    Ln.i("voip: call in " + app);
+                    Ln.i("voip: call in " + app + " (usage " + activeUsage + ")");
                     listener.onVoipCallStart(app);
                 }
                 return;
@@ -379,7 +419,7 @@ final class Voip {
                 guard(active);
                 return;
             }
-            boolean stillCalling = activeUid >= 0 && callingUids(audio, false).contains(activeUid);
+            boolean stillCalling = activeUid >= 0 && callingUids(audio, false).containsKey(activeUid);
             if (Checks.messengerCallGoesOn(mode, stillCalling)) {
                 // A phone call ringing over it took the mode; the messenger
                 // call itself goes on, and so does its recording.
@@ -398,6 +438,7 @@ final class Voip {
                 Ln.i("voip: call in " + active + " ended (audio mode " + mode + ")");
                 active = null;
                 activeUid = -1;
+                activeUsage = -1;
                 heldOver = false;
                 leftAt = 0;
                 listener.onVoipCallEnd();
@@ -407,7 +448,8 @@ final class Voip {
         /** An app on the list that is playing voice-call audio and capturing:
          *  a call, not a voice message. */
         private String callingApp() {
-            for (int uid : callingUids(audio, false)) {
+            for (Map.Entry<Integer, Integer> call : callingUids(audio, false).entrySet()) {
+                int uid = call.getKey();
                 String[] packages = FakeContext.get().getPackageManager().getPackagesForUid(uid);
                 if (packages == null) {
                     continue;
@@ -415,6 +457,7 @@ final class Voip {
                 for (String pkg : packages) {
                     if (apps.contains(pkg)) {
                         activeUid = uid;
+                        activeUsage = call.getValue();
                         return pkg;
                     }
                 }
@@ -456,26 +499,45 @@ final class Voip {
     /**
      * The apps in a call right now - any app, switched on here or not: each
      * playing voice-call audio and capturing at once, which a call does and a
-     * voice message does not. This process too only when [withThisProcess].
+     * voice message does not. The value is the usage the app was found on - 2
+     * for the call itself, 3 for its signalling stream - so the log can say
+     * which it was. This process too only when [withThisProcess].
      */
-    static Set<Integer> callingUids(AudioManager audio, boolean withThisProcess) {
-        Set<Integer> playing = new HashSet<>();
+    static Map<Integer, Integer> callingUids(AudioManager audio, boolean withThisProcess) {
+        Map<Integer, Integer> playing = new HashMap<>();
         for (AudioPlaybackConfiguration p : audio.getActivePlaybackConfigurations()) {
-            if (p.getAudioAttributes().getUsage() == AudioAttributes.USAGE_VOICE_COMMUNICATION) {
-                Integer uid = uidOf(p);
-                if (uid != null) {
-                    playing.add(uid);
+            int usage = p.getAudioAttributes().getUsage();
+            if (!isCallUsage(usage)) {
+                continue;
+            }
+            Integer uid = uidOf(p);
+            if (uid != null) {
+                // 2 wins where an app plays both: that is the call itself.
+                Integer had = playing.get(uid);
+                if (had == null || usage < had) {
+                    playing.put(uid, usage);
                 }
             }
         }
-        Set<Integer> calling = new HashSet<>();
+        Map<Integer, Integer> calling = new HashMap<>();
         for (AudioRecordingConfiguration r : audio.getActiveRecordingConfigurations()) {
             Integer uid = uidOf(r);
-            if (uid != null && (withThisProcess || uid != android.os.Process.myUid()) && playing.contains(uid)) {
-                calling.add(uid);
+            if (uid != null && (withThisProcess || uid != android.os.Process.myUid())
+                    && playing.containsKey(uid)) {
+                calling.put(uid, playing.get(uid));
             }
         }
         return calling;
+    }
+
+    /** Whether a playback usage is one a call's audio can carry. */
+    private static boolean isCallUsage(int usage) {
+        for (int call : CALL_USAGES) {
+            if (usage == call) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** getClientUid is a system API: by reflection, or null. */
